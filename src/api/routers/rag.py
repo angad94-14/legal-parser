@@ -4,8 +4,8 @@ RAG API endpoints.
 UPDATED: Uses singleton retriever with conversation memory.
 """
 
-from fastapi import APIRouter, HTTPException, status, BackgroundTasks
-from typing import Dict, Optional, Any
+from fastapi import APIRouter, HTTPException, status, BackgroundTasks, UploadFile, File
+from typing import Dict, Optional, Any, List
 import uuid
 from datetime import datetime
 import logging
@@ -77,7 +77,262 @@ def get_retriever() -> RAGRetriever:
 # Endpoints (with memory support)
 # ============================================================================
 
-# ... (keep all existing indexing endpoints unchanged) ...
+@router.post("/index", response_model=IndexResponse, status_code=status.HTTP_202_ACCEPTED)
+async def index_contracts(
+        request: IndexRequest,
+        background_tasks: BackgroundTasks
+):
+    """
+    Index contracts into RAG system.
+
+    **Process:**
+    1. Download PDFs from URLs
+    2. Parse PDFs → Extract text
+    3. Chunk text
+    4. Generate embeddings
+    5. Store in vector database
+
+    **Cost:** ~$0.002 per contract (embeddings only)
+    **Time:** ~2 seconds per contract
+
+    **Note:** Returns immediately with job_id. Processing happens in background.
+
+    **Example:**
+```bash
+    curl -X POST "http://localhost:8000/rag/index" \\
+         -H "Content-Type: application/json" \\
+         -d '{
+           "urls": [
+             "https://example.com/contract1.pdf",
+             "https://example.com/contract2.pdf"
+           ]
+         }'
+```
+
+    Args:
+        request: IndexRequest with PDF URLs
+        background_tasks: FastAPI background tasks
+
+    Returns:
+        IndexResponse with job_id (202 Accepted)
+    """
+    job_id = f"idx_{uuid.uuid4().hex[:12]}"
+
+    logger.info(f"[{job_id}] Starting indexing for {len(request.urls)} documents")
+
+    # Create job record
+    INDEXING_JOBS[job_id] = {
+        "status": "pending",
+        "total_documents": len(request.urls),
+        "processed": 0,
+        "successful": 0,
+        "failed": 0,
+        "created_at": datetime.utcnow()
+    }
+
+    # Queue background task
+    # Rationale: Don't block API response waiting for indexing
+    background_tasks.add_task(
+        process_indexing,
+        job_id,
+        request.urls,
+        request.metadata
+    )
+
+    return IndexResponse(
+        job_id=job_id,
+        total_documents=len(request.urls),
+        total_chunks=0,  # Will be updated when processing completes
+        successful=0,
+        failed=0,
+        cost_estimate=len(request.urls) * 0.002  # Rough estimate
+    )
+
+
+async def process_indexing(job_id: str, urls: list, metadata: dict = None):
+    """
+    Background task to process indexing.
+
+    Rationale: Long-running task shouldn't block API response.
+    - User gets job_id immediately
+    - Can poll for status
+    - Processing happens in background
+
+    Args:
+        job_id: Unique job ID
+        urls: List of PDF URLs
+        metadata: Optional metadata to attach
+    """
+    logger.info(f"[{job_id}] Background indexing started")
+
+    try:
+        # Update status
+        INDEXING_JOBS[job_id]["status"] = "processing"
+
+        # Initialize indexer
+        config = RAGConfig()
+        indexer = RAGIndexer(config)
+
+        # Download and index each PDF
+        pdf_paths = []
+
+        for i, url in enumerate(urls, 1):
+            try:
+                # Download PDF
+                import httpx
+
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(str(url), timeout=30.0)
+                    response.raise_for_status()
+                    pdf_content = response.content
+
+                # Save to temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_file.write(pdf_content)
+                    pdf_paths.append(Path(tmp_file.name))
+
+                logger.info(f"[{job_id}] Downloaded {i}/{len(urls)}")
+
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to download {url}: {e}")
+                INDEXING_JOBS[job_id]["failed"] += 1
+
+        # Index all PDFs
+        if pdf_paths:
+            results = indexer.index_multiple_contracts(pdf_paths)
+
+            INDEXING_JOBS[job_id]["successful"] = results["successful"]
+            INDEXING_JOBS[job_id]["failed"] += results["failed"]
+            INDEXING_JOBS[job_id]["total_chunks"] = results["total_chunks"]
+
+        # Cleanup temp files
+        for path in pdf_paths:
+            try:
+                path.unlink()
+            except:
+                pass
+
+        # Update status
+        INDEXING_JOBS[job_id]["status"] = "completed"
+        logger.info(
+            f"[{job_id}] Indexing complete: "
+            f"{INDEXING_JOBS[job_id]['successful']} successful, "
+            f"{INDEXING_JOBS[job_id]['failed']} failed"
+        )
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Indexing failed: {e}", exc_info=True)
+        INDEXING_JOBS[job_id]["status"] = "failed"
+        INDEXING_JOBS[job_id]["error"] = str(e)
+
+
+@router.get("/index/{job_id}")
+async def get_indexing_status(job_id: str):
+    """
+    Get status of indexing job.
+
+    **Use case:** Poll for indexing progress
+
+    **Example:**
+```bash
+    curl "http://localhost:8000/rag/index/idx_abc123"
+```
+
+    Args:
+        job_id: Unique job ID
+
+    Returns:
+        Job status and progress
+    """
+    if job_id not in INDEXING_JOBS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+
+    return INDEXING_JOBS[job_id]
+
+
+@router.post("/index/upload", status_code=status.HTTP_200_OK)
+async def index_contracts_upload(
+        files: List[UploadFile] = File(..., description="PDF contracts to index")
+):
+    """
+    Index multiple contracts via direct file upload (synchronous).
+
+    **For async indexing from URLs, use POST /rag/index instead.**
+
+    **Process:**
+    1. Upload PDF files
+    2. Parse and chunk
+    3. Generate embeddings
+    4. Store in vector database
+
+    **Time:** ~2-3 seconds per contract
+
+    Args:
+        files: List of PDF files
+
+    Returns:
+        Indexing results
+    """
+    import tempfile
+
+    try:
+        # Create RAGIndexer directly (separate from retriever)
+        config = RAGConfig()
+        indexer = RAGIndexer(config)  # ← Create indexer
+
+        # Create temp directory for uploaded files
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Save all uploaded files
+            saved_files = []
+            for file in files:
+                if not file.filename.lower().endswith('.pdf'):
+                    logger.warning(f"Skipping non-PDF file: {file.filename}")
+                    continue
+
+                file_path = tmp_path / file.filename
+                content = await file.read()
+                file_path.write_bytes(content)
+                saved_files.append(file_path)
+
+            if not saved_files:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No valid PDF files provided"
+                )
+
+            # Index all files using indexer.index_multiple_contracts()
+            logger.info(f"Indexing {len(saved_files)} contracts...")
+
+            results = indexer.index_multiple_contracts(saved_files)
+
+            # Get updated stats
+            stats = indexer.get_stats()
+
+            logger.info(
+                f"Successfully indexed {results['successful']} contracts "
+                f"({results['failed']} failed)"
+            )
+
+            return {
+                "status": "success",
+                "indexed_files": results['successful'],
+                "failed_files": results['failed'],
+                "filenames": [f.name for f in saved_files],
+                "total_documents": len(stats["sample_contracts"]),  # ← Use sample_contracts length
+                "total_chunks": stats["total_chunks"]
+            }
+
+    except Exception as e:
+        logger.error(f"Indexing failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Indexing failed: {str(e)}"
+        )
 
 @router.post("/search", response_model=SearchResponse)
 async def search_contracts(request: SearchRequest):

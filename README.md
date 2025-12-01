@@ -10,14 +10,25 @@ AI-powered system for extracting structured information from legal contracts usi
 - 🧪 Comprehensive test suite
 - 📊 MLOps best practices (versioning, monitoring, CI/CD)
 
+## Architecture
+![Architecture Diagram](./architecture.png)
+
 ## Tech Stack
+**Backend:**
 - **Language**: Python 3.10+
 - **Framework**: FastAPI
 - **LLM**: OpenAI GPT-4 / Anthropic Claude
 - **Orchestration**: LangChain, LangGraph
 - **Package Manager**: Poetry
 - **Testing**: Pytest
+- **Type Safety**: Pydantic
 - **Containerization**: Docker
+  
+**Frontend:**
+- Streamlit (web UI)
+
+**Deployment:**
+- AWS EC2
 
 ## Dataset
 Using **CUAD (Contract Understanding Atticus Dataset)** from https://www.atticusprojectai.org/cuad
@@ -28,7 +39,7 @@ Using **CUAD (Contract Understanding Atticus Dataset)** from https://www.atticus
 ## Quick Start
 
 ### Prerequisites
-- Python 3.10 or higher
+- Python 3.12 or higher
 - Poetry ([installation guide](https://python-poetry.org/docs/#installation))
 - OpenAI API key
 
@@ -87,27 +98,26 @@ legal-contract-parser/
 
 ## Development Roadmap
 
-### Phase 1: Core Parser ✅
+### Phase 1: Core Parser
 - [x] Project setup
-- [ ] PDF parsing
-- [ ] LLM extraction (direct)
-- [ ] REST API
-- [ ] Testing framework
+- [x] PDF parsing
+- [x] LLM extraction (direct)
+- [x] REST API
+- [x] Testing framework
 
-### Phase 2: Agentic Enhancement 🚧
+### Phase 2: Agentic Enhancement
 - [ ] LangGraph integration
 - [ ] Tool ecosystem (4 tools)
 - [ ] Cross-reference resolution
 - [ ] Validation & consistency checks
 
-### Phase 3: MLOps & Production 📋
+### Phase 3: MLOps & Production
 - [ ] CI/CD pipeline
 - [ ] Monitoring dashboard
 - [ ] Docker deployment
-- [ ] Documentation & demo
 
 ## Status
-🚧 **In Active Development** - Phase 1
+**In Active Development** - Phase 1
 
 ## License
 MIT

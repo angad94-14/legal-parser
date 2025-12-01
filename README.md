@@ -2,6 +2,17 @@
 
 AI-powered system for extracting structured information from legal contracts using LLMs and agentic workflows.
 
+## Live Demo
+
+**Try it now:** http://3.16.113.93:8501
+
+**What it does:**
+- Ask questions about 30+ indexed contracts with conversation memory
+- Upload contracts to extract structured metadata (15 clause types)
+- Semantic search with source citations
+
+**API Documentation:** http://3.16.113.93:8000/docs
+
 ## Features
 - 📄 PDF contract parsing with structure preservation
 - 🤖 LLM-based clause extraction (15+ clause types)

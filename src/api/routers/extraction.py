@@ -98,6 +98,8 @@ def convert_to_api_response(
 
 
 @router.post("/", response_model=ExtractResponse, status_code=status.HTTP_200_OK)
+@router.post("", response_model=ExtractResponse, status_code=status.HTTP_200_OK)
+
 async def extract_contract(file: UploadFile = File(...)):
     """
     Extract clauses from a single contract PDF.

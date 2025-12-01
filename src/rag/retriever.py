@@ -1,16 +1,7 @@
 """
 RAG Retriever - Search and answer questions using modern LCEL.
 
-Modern Approach: Uses LangChain Expression Language (LCEL)
-- ChatPromptTemplate for chat-style prompts
-- Runnable chains for composition
-- Better type safety and flexibility
-
-Rationale: LCEL is the modern LangChain pattern (2024+)
-- More maintainable
-- Better error messages
-- Easier to customize
-- Industry standard
+UPDATED: Now includes conversation memory for multi-turn conversations.
 """
 
 from typing import List, Dict, Any, Optional
@@ -18,12 +9,13 @@ import logging
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
+from langchain_classic.memory import ConversationBufferWindowMemory
 
-from src.utils.rag_config import RAGConfig, DEFAULT_RAG_CONFIG
 from src.utils.config import settings
+from src.utils.rag_config import RAGConfig, DEFAULT_RAG_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -32,22 +24,29 @@ class RAGRetriever:
     """
     Retrieves information from indexed contracts using modern LCEL.
 
-    Design Pattern: LCEL (LangChain Expression Language)
+    UPDATED: Now includes conversation memory for follow-up questions.
+
+    Design Pattern: LCEL (LangChain Expression Language) with memory
     - Chains are composable with | operator
-    - Type-safe
-    - Easy to debug
+    - Memory tracks last K conversation turns
+    - Type-safe and easy to debug
 
-    Two main operations:
-    1. Search: Find relevant chunks (pure retrieval)
-    2. Answer: Generate answer from chunks (RAG)
+    Memory Strategy:
+    - Uses ConversationBufferWindowMemory (k=5)
+    - Keeps last 5 exchanges (10 messages)
+    - Balances context vs token cost
+    - Prevents memory overflow
 
-    Interview Note: Using modern LCEL shows you stay current with
-    best practices and aren't just copying old tutorials.
+    Note: Single-user mode - all requests share same memory.
+    For multi-user: would need session-based memory instances.
+
+    Interview Note: Using windowed memory shows you understand
+    token limits and cost optimization.
     """
 
     def __init__(self, config: RAGConfig = DEFAULT_RAG_CONFIG):
         """
-        Initialize retriever with modern LCEL approach.
+        Initialize retriever with modern LCEL approach and conversation memory.
 
         Args:
             config: RAG configuration
@@ -57,7 +56,7 @@ class RAGRetriever:
         # Initialize embeddings (same model as indexing!)
         self.embeddings = OpenAIEmbeddings(
             model=config.embedding_model,
-            api_key=settings.openai_api_key
+            openai_api_key=settings.openai_api_key
         )
 
         # Load vector store
@@ -72,77 +71,94 @@ class RAGRetriever:
             model=config.generation_model,
             temperature=config.generation_temperature,
             max_tokens=config.generation_max_tokens,
+            openai_api_key=settings.openai_api_key
         )
 
         # Create retriever from vector store
-        # Rationale: Retriever is a standard interface in LangChain
-        # - Has .invoke() method
-        # - Can be used in LCEL chains with | operator
         self.retriever = self.vector_store.as_retriever(
             search_kwargs={"k": config.retrieval_top_k}
         )
 
-        # Create RAG chain using modern LCEL
+        # NEW: Add conversation memory
+        # Rationale: Keep last 5 exchanges (10 messages)
+        # - Enough for context continuity
+        # - Won't hit token limits
+        # - Keeps costs reasonable
+        self.memory = ConversationBufferWindowMemory(
+            k=5,  # Keep last 5 exchanges
+            memory_key="chat_history",
+            return_messages=True,
+            input_key="question",
+            output_key="answer"
+        )
+
+        # Create RAG chain using modern LCEL with memory support
         self.rag_chain = self._create_rag_chain()
 
-        logger.info("RAGRetriever initialized with modern LCEL")
+        logger.info("RAGRetriever initialized with LCEL and conversation memory (k=5)")
 
     def _create_rag_chain(self):
         """
-        Create RAG chain using LCEL (LangChain Expression Language).
+        Create RAG chain using LCEL with conversation memory support.
 
         Returns:
-            Runnable chain for RAG
+            Runnable chain for RAG with memory
 
-        Rationale: LCEL uses | operator to compose chains.
+        Rationale: Uses RunnablePassthrough.assign to handle dict inputs.
+
+        Input format:
+        {
+            "question": "What is X?",
+            "chat_history": [HumanMessage(...), AIMessage(...), ...]
+        }
 
         Chain flow:
-        1. Input: {"question": "What is X?"}
-        2. RunnableParallel retrieves context and passes question
-        3. Prompt formats context + question
-        4. LLM generates answer
-        5. StrOutputParser extracts text from LLM response
-
+        1. Receive dict with question + chat_history
+        2. Extract question → retrieve context → add to dict
+        3. Pass question + chat_history + context to prompt
+        4. LLM generates answer with full context
+        5. Parse and return answer string
         """
 
-        # Define prompt template with chat format
-        # Rationale: ChatPromptTemplate supports system/user roles
-        # Better for modern chat models (GPT-4, Claude, etc.)
+        # Define prompt template with chat history
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a legal contract analysis assistant. 
-Use the following contract excerpts to answer questions accurately.
+    Use the following contract excerpts to answer questions accurately.
 
-**Instructions:**
-- Base your answer ONLY on the provided contract excerpts
-- Cite specific contracts and sections you reference
-- If the answer is not in the excerpts, say "I don't have enough information to answer this based on the provided contracts."
-- Be precise and concise"""),
+    **Instructions:**
+    - Base your answer ONLY on the provided contract excerpts
+    - Consider the conversation history for context on follow-up questions
+    - Cite specific contracts and sections you reference
+    - If the answer is not in the excerpts, say "I don't have enough information to answer this based on the provided contracts."
+    - Be precise and concise"""),
+
+            # Chat history placeholder
+            MessagesPlaceholder(variable_name="chat_history"),
+
             ("human", """Contract Excerpts:
-{context}
+    {context}
 
-Question: {question}
+    Question: {question}
 
-Answer:""")
+    Answer:""")
         ])
 
         # Helper function to format retrieved documents
-        # Rationale: Retrieved docs need to be converted to string
         def format_docs(docs):
             """Format retrieved documents into context string."""
             return "\n\n".join(doc.page_content for doc in docs)
 
         # Build LCEL chain
-        # Rationale: | operator composes runnables
-        # RunnableParallel runs retriever and question in parallel
-        # Then pipes to prompt → LLM → parser
+        # RunnablePassthrough.assign adds fields to input dict
         rag_chain = (
-            RunnableParallel(
-                context=self.retriever | format_docs,  # Retrieve & format
-                question=RunnablePassthrough()          # Pass question through
-            )
-            | prompt           # Format prompt with context + question
-            | self.llm         # Generate answer
-            | StrOutputParser() # Extract string from LLM response
+                RunnablePassthrough.assign(
+                    # Add context field by retrieving based on question
+                    context=lambda x: format_docs(self.retriever.invoke(x["question"]))
+                )
+                # Now input dict has: question, chat_history, context
+                | prompt
+                | self.llm
+                | StrOutputParser()
         )
 
         return rag_chain
@@ -156,6 +172,9 @@ Answer:""")
         """
         Search for relevant chunks (retrieval only, no generation).
 
+        Note: This does NOT use conversation memory.
+        Pure search operations don't need conversational context.
+
         Args:
             query: Search query
             top_k: Number of results (overrides config)
@@ -163,9 +182,6 @@ Answer:""")
 
         Returns:
             List of matching chunks with metadata and scores
-
-        Rationale: Pure vector search without LLM generation.
-        Fast and cheap for exploratory queries.
         """
         k = top_k or self.config.retrieval_top_k
 
@@ -202,7 +218,9 @@ Answer:""")
         return_sources: bool = True
     ) -> Dict[str, Any]:
         """
-        Answer question using RAG (modern LCEL approach).
+        Answer question using RAG with conversation memory.
+
+        UPDATED: Now includes conversation history in LLM context.
 
         Args:
             query: User question
@@ -211,27 +229,45 @@ Answer:""")
         Returns:
             Dictionary with answer and optional sources
 
-        Rationale: Full RAG with modern LCEL chain.
-
         Process:
-        1. Chain retrieves relevant chunks
-        2. Formats prompt with chunks + question
-        3. LLM generates answer
-        4. Returns answer + sources
+        1. Load conversation history from memory
+        2. Chain retrieves relevant chunks
+        3. Formats prompt with history + chunks + question
+        4. LLM generates answer (aware of conversation context)
+        5. Save interaction to memory
+        6. Return answer + sources
 
         Example:
+            # First question
             result = retriever.answer("Which contracts have CA law?")
-            print(result['answer'])
-            for source in result['sources']:
-                print(f"  - {source['metadata']['filename']}")
+            # Answer: "TechCorp, Euromedia, Cybergy"
+
+            # Follow-up (uses memory!)
+            result = retriever.answer("What are their payment terms?")
+            # Answer: "TechCorp: Net 30, Euromedia: Net 60, Cybergy: Net 45"
+            # ↑ LLM knows "their" refers to the 3 contracts from previous Q!
         """
         logger.info(f"Answering query: '{query}'")
 
-        # Generate answer using LCEL chain
-        # Rationale: .invoke() runs the full chain
-        # Input: question string
-        # Output: answer string
-        answer = self.rag_chain.invoke(query)
+        # Load conversation history from memory
+        memory_vars = self.memory.load_memory_variables({})
+        chat_history = memory_vars.get("chat_history", [])
+
+        logger.info(f"Using {len(chat_history)} messages from conversation history")
+
+        # Generate answer using LCEL chain with history
+        # The chain expects: question (str) and chat_history (list of messages)
+        answer = self.rag_chain.invoke({
+            "question": query,
+            "chat_history": chat_history
+        })
+
+        # Save this interaction to memory
+        # Rationale: Memory will be used for next question
+        self.memory.save_context(
+            {"question": query},
+            {"answer": answer}
+        )
 
         response = {
             "query": query,
@@ -239,23 +275,25 @@ Answer:""")
         }
 
         # Retrieve sources if requested
-        # Rationale: LCEL chain doesn't automatically return sources
-        # We need to retrieve them separately
         if return_sources:
             # Use retriever directly to get source docs
-            source_docs = self.retriever.invoke(query)
-
+            # source_docs = self.retriever.invoke(query)
+            source_docs = self.vector_store.similarity_search_with_score(
+                query,
+                k=self.config.retrieval_top_k
+            )
             sources = []
-            for doc in source_docs:
+            for doc, score in source_docs:
                 sources.append({
                     "text": doc.page_content,
                     "metadata": doc.metadata,
+                    "score": float(score)
                 })
 
             response["sources"] = sources
             response["num_sources"] = len(sources)
 
-        logger.info(f"Generated answer ({len(answer)} chars)")
+        logger.info(f"Generated answer ({len(answer)} chars) with memory context")
         return response
 
     def answer_with_context(
@@ -266,18 +304,15 @@ Answer:""")
         """
         Generate answer given explicit context chunks (bypass retrieval).
 
+        Note: This does NOT use conversation memory.
+        Used for custom retrieval scenarios where memory isn't needed.
+
         Args:
             query: User question
             context_chunks: Pre-selected context chunks
 
         Returns:
             Generated answer
-
-        Rationale: Manual control over retrieval.
-        Useful for:
-        - Custom retrieval logic
-        - Hybrid search
-        - Debugging
         """
         context = "\n\n".join(context_chunks)
 
@@ -301,53 +336,87 @@ Answer:""")
         """
         Stream answer in real-time (for UI responsiveness).
 
+        UPDATED: Now includes conversation memory.
+
         Args:
             query: User question
 
         Yields:
             Chunks of the answer as they're generated
 
-        Rationale: Streaming improves perceived latency.
-        User sees partial answer immediately instead of waiting
-        for complete response.
-
-        Example:
-            for chunk in retriever.stream_answer("What is X?"):
-                print(chunk, end="", flush=True)
-
-        Interview Note: Shows you understand UX considerations.
-        Streaming is critical for good chat experiences.
+        Note: Memory is saved after streaming completes.
         """
         logger.info(f"Streaming answer for: '{query}'")
 
-        # LCEL chains support streaming with .stream()
-        for chunk in self.rag_chain.stream(query):
+        # Load conversation history
+        memory_vars = self.memory.load_memory_variables({})
+        chat_history = memory_vars.get("chat_history", [])
+
+        # Stream the response
+        full_answer = ""
+        for chunk in self.rag_chain.stream({
+            "question": query,
+            "chat_history": chat_history
+        }):
+            full_answer += chunk
             yield chunk
 
+        # Save to memory after streaming completes
+        self.memory.save_context(
+            {"question": query},
+            {"answer": full_answer}
+        )
 
-# Convenience functions
+    def clear_memory(self):
+        """
+        Clear conversation memory.
+
+        Use cases:
+        - Start fresh conversation
+        - Reset after testing
+        - Clear after inactivity
+
+        Example:
+            retriever.clear_memory()
+        """
+        self.memory.clear()
+        logger.info("Conversation memory cleared")
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about current memory state.
+
+        Returns:
+            Dictionary with memory info
+
+        Example:
+            stats = retriever.get_memory_stats()
+            # {
+            #   "num_messages": 10,
+            #   "num_exchanges": 5,
+            #   "window_size": 5
+            # }
+        """
+        memory_vars = self.memory.load_memory_variables({})
+        messages = memory_vars.get("chat_history", [])
+
+        return {
+            "num_messages": len(messages),
+            "num_exchanges": len(messages) // 2,
+            "window_size": self.memory.k
+        }
+
+
+# Convenience functions (unchanged)
 
 def search_contracts(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Quick search function.
-
-    Example:
-        results = search_contracts("payment terms")
-        for r in results:
-            print(r['metadata']['filename'])
-    """
+    """Quick search function."""
     retriever = RAGRetriever()
     return retriever.search(query, top_k=top_k)
 
 
 def answer_question(query: str) -> str:
-    """
-    Quick answer function.
-
-    Example:
-        answer = answer_question("What is the governing law?")
-        print(answer)
-    """
+    """Quick answer function."""
     retriever = RAGRetriever()
     result = retriever.answer(query, return_sources=False)
     return result["answer"]

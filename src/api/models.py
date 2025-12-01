@@ -354,6 +354,10 @@ class Source(BaseModel):
         description="Source metadata (filename, page, etc.)"
     )
 
+    score: float = Field(
+        description="Similarity score (0-1)"
+    )
+
 
 class QueryResponse(BaseModel):
     """
